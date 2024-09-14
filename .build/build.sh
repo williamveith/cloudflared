@@ -1,50 +1,88 @@
 #!/bin/bash
 
-# Enable exporting of all variables defined in the script and sourced files
-set -o allexport
-# Load environment variables from the .env file
-source .env
-# Disable exporting of variables
-set +o allexport
+set -o allexport # Enable exporting of all variables defined
+source .env      # Load environment variables from .env
+set +o allexport # Disable exporting of variables
 
-# Define source and temporary directories
-SOURCE_DIR=~/.cloudflared       # Directory where cloudflared-related files are stored locally
-TEMP_DIR=temp                   # Temporary directory to store files before transferring to the container
+TEMP_DIR=temp                                                         # Path (local): temporary directory
+ORIGIN_CERT_LOCAL="$CLOUDFLARED_SOURCE_DIR"/cert.pem                  # Path (local): origin certificate
+ORIGIN_CERT_CONTAINER=/etc/cloudflared/cert.pem                       # Path (container): origin certificate
+CREDENTIALS_FILE_LOCAL="$CLOUDFLARED_SOURCE_DIR"/"$TUNNEL_ID".json    # Path (local): tunnel credentials file
+CREDENTIALS_FILE_CONTAINER=/etc/cloudflared/"$TUNNEL_ID".json         # Path (container): credentials file
+CONFIG_FILE_CONTAINER=/etc/cloudflared/config.yml                     # Path (container): generated config file
 
-# Define paths for the origin certificate (both local and inside the container)
-ORIGIN_CERT_LOCAL="$SOURCE_DIR"/cert.pem                  # Local path to the origin certificate
-ORIGIN_CERT_CONTAINER=/etc/cloudflared/cert.pem           # Path inside the container for the origin certificate
-
-# Define paths for the credentials file (both local and inside the container)
-CREDENTIALS_FILE_LOCAL="$SOURCE_DIR"/"$TUNNEL_ID".json    # Local path to the tunnel credentials file
-CREDENTIALS_FILE_CONTAINER=/etc/cloudflared/"$TUNNEL_ID".json  # Path inside the container for the credentials file
-
-# Define path for the configuration file inside the container
-CONFIG_FILE_CONTAINER=/etc/cloudflared/config.yml
-
-
-# Function to check if a command exists on the system
+# Check if command exists on the system
 command_exists() {
-    command -v "$1" >/dev/null 2>&1  # Check if the command is available and suppress output
+    command -v "$1" >/dev/null 2>&1
 }
 
-# Determine which container runtime is available: prefer Docker, fall back to Podman
+# Starts docker daemon
+start_docker() {
+  case "$(uname -s)" in
+    Linux*)
+      sudo systemctl start docker
+      while ! sudo systemctl is-active --quiet docker; do
+        sleep 2
+      done
+      ;;
+    Darwin*)
+      open -a Docker
+      while ! docker info > /dev/null 2>&1; do
+        sleep 2
+      done
+      ;;
+    MINGW* | CYGWIN* | MSYS*)
+      powershell.exe -Command "Start-Process 'Docker Desktop' -Wait"
+      while ! docker info > /dev/null 2>&1; do
+          sleep 2
+      done
+      ;;
+    *)
+      echo "Could not start Docker Daemon. Linux | Darwin* |MINGW* | CYGWIN* | MSYS* are supported. Build will be tried anyways. If failure occures this could be one reason"
+      ;;
+  esac
+}
+
+# Checks if the Podman machine exists and is running. Uses default machine unless a name is provided.
+# Creates and/or starts the machine if it does not exist or is stopped.
+start_podman() {
+  local MACHINE_NAME="${1:-default}"
+
+  if ! podman machine ls --format "{{.Name}} {{.Running}}" | grep -q "^${MACHINE_NAME} true$"; then
+    if podman machine ls --format "{{.Name}}" | grep -q "^${MACHINE_NAME}$"; then
+      podman machine start "${MACHINE_NAME}" || {
+        echo "Failed to start Podman machine '${MACHINE_NAME}'."
+        return 1
+      }
+    else
+      podman machine init "${MACHINE_NAME}" || {
+        echo "Failed to create Podman machine '${MACHINE_NAME}'."
+        return 1
+      }
+      podman machine start "${MACHINE_NAME}" || {
+        echo "Failed to start Podman machine '${MACHINE_NAME}' after creation."
+        return 1
+      }
+    fi
+  fi
+  return 0
+}
+
+# Determine which container runtime is available: Docker, Podman
 if command_exists docker; then
-    CONTAINER_RUNTIME="docker"
+  CONTAINER_RUNTIME="docker"
+  start_docker
 elif command_exists podman; then
-    CONTAINER_RUNTIME="podman"
+  CONTAINER_RUNTIME="podman"
+  start_podman
 else
-    echo "Neither Podman nor Docker is installed. Please install one of them."
-    exit 1
+  echo "Neither Podman nor Docker is installed. Please install one of them."
+  exit 1
 fi
 
-# Display which container runtime will be used
-echo "Using $CONTAINER_RUNTIME as the container runtime."
-
-# Create necessary directories and copy certificates and credentials to the temporary directory
-sudo mkdir -p "$TEMP_DIR"/etc/cloudflared
-sudo cp "$ORIGIN_CERT_LOCAL" "$TEMP_DIR"/"$ORIGIN_CERT_CONTAINER" # Copy origin certificate to the temporary directory
-sudo cp "$CREDENTIALS_FILE_LOCAL" "$TEMP_DIR"/"$CREDENTIALS_FILE_CONTAINER" # Copy credentials file to the temporary directory
+sudo mkdir -p "$TEMP_DIR"/etc/cloudflared                                   # Make temporary directory
+sudo cp "$ORIGIN_CERT_LOCAL" "$TEMP_DIR"/"$ORIGIN_CERT_CONTAINER"           # Copy origin certificate to temporary directory
+sudo cp "$CREDENTIALS_FILE_LOCAL" "$TEMP_DIR"/"$CREDENTIALS_FILE_CONTAINER" # Copy credentials file to temporary directory
 
 # Description of the dynamically generated cloudflared configuration file:
 # - tunnel: Specifies the Tunnel ID used for routing traffic through Cloudflare.
@@ -73,33 +111,38 @@ ingress:
   - service: http_status:404
 EOF
 
-# Set permissions for directories and files in the temporary directory
-sudo find "$TEMP_DIR" -type d -exec chmod 755 {} +  # Set directory permissions to be readable and executable
-sudo find "$TEMP_DIR" -type f -exec chmod 644 {} +  # Set file permissions to be readable
+# Set permissions directories/files in temp directory
+sudo find "$TEMP_DIR" -type d -exec chmod 755 {} +            # Set directory to read/execute
+sudo find "$TEMP_DIR" -type f -exec chmod 644 {} +            # Set file to readable
 
-# Remove any existing container with the same name, ignore errors if not found
+# Remove existing container with same name
 $CONTAINER_RUNTIME rm -f "$NAME" || true
 
-# Determine the architecture of the current machine
+# Detects architecture (amd64, arm64, 386, arm, armhf) exits with error if unsupported
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
-    ARCHITECTURE="amd64"              # Set architecture to amd64 if the system is 64-bit x86
+    ARCHITECTURE="amd64"                                      # 64-bit x86
 elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-    ARCHITECTURE="arm64"              # Set architecture to arm64 if the system is 64-bit ARM
+    ARCHITECTURE="arm64"                                      # 64-bit ARM
+elif [ "$ARCH" = "386" ] || [ "$ARCH" = "i386" ]; then
+    ARCHITECTURE="386"                                        # 32-bit x86
+elif [ "$ARCH" = "arm" ]; then
+    ARCHITECTURE="arm"                                        # 32-bit ARM
+elif [ "$ARCH" = "armhf" ]; then
+    ARCHITECTURE="armhf"                                      # ARM with hardware floating-point support
 else
-    # Exit if the architecture is unsupported
     echo "Unsupported architecture: $ARCH"
     exit 1
 fi
 
-# Define the image tag based on the version and architecture
-IMAGE_TAG="cloudflared:${VERSION}-${ARCHITECTURE}"
+# Image tag based on version and architecture
+IMAGE_TAG="williamveith/cloudflared:${VERSION}.${ARCHITECTURE}"
 
-# Build the Docker or Podman image using the specified version and architecture
+# Builds image using specified version and architecture
 $CONTAINER_RUNTIME build --build-arg VERSION=$VERSION --build-arg ARCHITECTURE=$ARCHITECTURE -t $IMAGE_TAG .
 
-# Remove the temporary directory and its contents
+# Deletes temporary directory
 sudo rm -rf "$TEMP_DIR"
 
-# Create and start the container using the built image
+# Create/start container using built image
 $CONTAINER_RUNTIME run -d --name $NAME $IMAGE_TAG
