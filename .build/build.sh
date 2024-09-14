@@ -80,6 +80,12 @@ else
   exit 1
 fi
 
+# Downloads the origin certification if it is not found
+if [ ! -f "$ORIGIN_CERT_LOCAL" ]; then
+    echo "Origin certificate not found. Sign into cloudflare"
+    cloudflared login
+fi
+
 sudo mkdir -p "$TEMP_DIR"/etc/cloudflared                                   # Make temporary directory
 sudo cp "$ORIGIN_CERT_LOCAL" "$TEMP_DIR"/"$ORIGIN_CERT_CONTAINER"           # Copy origin certificate to temporary directory
 sudo cp "$CREDENTIALS_FILE_LOCAL" "$TEMP_DIR"/"$CREDENTIALS_FILE_CONTAINER" # Copy credentials file to temporary directory
